@@ -93,13 +93,22 @@ def get_price_series(
         "interval": "1d",
     }
     payload.update(_DEFAULT_PARAMS)
-    response = session.get(url, params=payload)  # Use shared session
+
+    try:
+        response = session.get(url, params=payload, timeout=10)  # Use shared session with timeout
+    except requests.exceptions.RequestException as e:
+        raise YahooError(f"Connection error fetching data for {ticker}: {str(e)}")
+
     result = parse_response(response)
 
     meta = result["meta"]
-    tzone = timezone(
-        timedelta(hours=meta["gmtoffset"] / 3600), meta["exchangeTimezoneName"]
-    )
+    try:
+        tzone = timezone(
+            timedelta(hours=meta["gmtoffset"] / 3600), meta["exchangeTimezoneName"]
+        )
+    except KeyError:
+        # If timezone info is missing, use UTC
+        tzone = timezone.utc
 
     if "timestamp" not in result:
         raise YahooError(
@@ -116,7 +125,8 @@ def get_price_series(
         if price is not None
     ]
 
-    currency = result["meta"]["currency"]
+    # Get currency from meta, default to USD if not available
+    currency = meta.get("currency", "USD")
     return series, currency
 
 
@@ -132,11 +142,25 @@ class Source(source.Source):
                 "Gecko/20100101 Firefox/110.0"
             }
         )
-        # This populates the correct cookies in the session
-        self.session.get("https://fc.yahoo.com")
-        self.crumb = self.session.get(
-            "https://query1.finance.yahoo.com/v1/test/getcrumb"
-        ).text
+        # Try to initialize cookies using a more reliable domain
+        try:
+            # Try the main Yahoo Finance domain instead of fc.yahoo.com
+            self.session.get("https://finance.yahoo.com", timeout=10)
+        except requests.exceptions.RequestException as e:
+            # If that fails, we'll continue without cookies
+            # This might limit some functionality but allows basic price fetching
+            pass
+
+        # Try to get the crumb, but handle failure gracefully
+        try:
+            self.crumb = self.session.get(
+                "https://query1.finance.yahoo.com/v1/test/getcrumb",
+                timeout=10
+            ).text
+        except requests.exceptions.RequestException:
+            # If we can't get a crumb, use an empty string
+            # Some API endpoints might still work without it
+            self.crumb = ""
 
     def get_latest_price(self, ticker: str) -> Optional[source.SourcePrice]:
         """See contract in beanprice.source.Source."""
@@ -147,10 +171,14 @@ class Source(source.Source):
             "symbols": ticker,
             "fields": ",".join(fields),
             "exchange": "NYSE",
-            "crumb": self.crumb,  # Use the session’s crumb
+            "crumb": self.crumb,  # Use the session's crumb
         }
         payload.update(_DEFAULT_PARAMS)
-        response = self.session.get(url, params=payload)  # Use shared session
+
+        try:
+            response = self.session.get(url, params=payload, timeout=10)  # Use shared session with timeout
+        except requests.exceptions.RequestException as e:
+            raise YahooError(f"Connection error fetching data for {ticker}: {str(e)}")
 
         try:
             result = parse_response(response)
@@ -158,6 +186,7 @@ class Source(source.Source):
             # The parse_response method cannot know which ticker failed,
             # but the user definitely needs to know which ticker failed!
             raise YahooError("%s (ticker: %s)" % (error, ticker)) from error
+
         try:
             price = Decimal(result["regularMarketPrice"])
 
@@ -171,7 +200,12 @@ class Source(source.Source):
                 "Invalid response from Yahoo: {}".format(repr(result))
             ) from exc
 
+        # Try to get currency from the result, fall back to USD if not available
         currency = parse_currency(result)
+        if currency is None and "currency" in result:
+            currency = result["currency"]
+        if currency is None:
+            currency = "USD"  # Default to USD if we can't determine the currency
 
         return source.SourcePrice(price, trade_time, currency)
 
@@ -181,9 +215,20 @@ class Source(source.Source):
         """See contract in beanprice.source.Source."""
 
         # Get the latest data returned over the last 5 days.
-        series, currency = get_price_series(
-            ticker, time - timedelta(days=5), time, self.session
-        )
+        try:
+            series, currency = get_price_series(
+                ticker, time - timedelta(days=5), time, self.session
+            )
+        except YahooError as e:
+            # Try a longer time range if the 5-day range fails
+            try:
+                series, currency = get_price_series(
+                    ticker, time - timedelta(days=30), time, self.session
+                )
+            except YahooError:
+                # Re-raise the original error if both attempts fail
+                raise e
+
         latest = None
         for data_dt, price in sorted(series):
             if data_dt >= time:
@@ -192,6 +237,7 @@ class Source(source.Source):
         if latest is None:
             raise YahooError("Could not find price before {} in {}".format(time, series))
 
+        data_dt, price = latest
         return source.SourcePrice(price, data_dt, currency)
 
     def get_daily_prices(
