@@ -39,10 +39,56 @@ def fetch_quote(ticker, time=None):
         )
     result = response.json()
 
-    price = Decimal(result["data"]["amount"])
+    # Check if data is a list or dictionary and handle accordingly
+    if isinstance(result.get("data"), list):
+        # If it's a list, find the entry that matches our ticker
+        ticker_parts = ticker.lower().split('-')
+        if len(ticker_parts) != 2:
+            raise CoinbaseError(f"Invalid ticker format: {ticker}. Expected format: BASE-CURRENCY")
+
+        base_currency = ticker_parts[0].upper()
+        quote_currency = ticker_parts[1].upper()
+
+        # Try to find the matching entry
+        matching_entries = [
+            item for item in result["data"]
+            if item.get("base", "").upper() == base_currency and
+               item.get("currency", "").upper() == quote_currency
+        ]
+
+        if matching_entries:
+            data_item = matching_entries[0]
+            price = Decimal(data_item.get("amount", 0))
+            currency = data_item.get("currency", "")
+        else:
+            # If no exact match, take the first entry with the right quote currency
+            quote_currency_entries = [
+                item for item in result["data"]
+                if item.get("currency", "").upper() == quote_currency
+            ]
+
+            if quote_currency_entries:
+                data_item = quote_currency_entries[0]
+                price = Decimal(data_item.get("amount", 0))
+                currency = data_item.get("currency", "")
+            else:
+                # If still no match, just take the first entry
+                if result["data"]:
+                    data_item = result["data"][0]
+                    price = Decimal(data_item.get("amount", 0))
+                    currency = data_item.get("currency", "")
+                else:
+                    raise CoinbaseError(f"No price data found in response: {result}")
+    else:
+        # Original behavior for dictionary
+        try:
+            price = Decimal(result["data"]["amount"])
+            currency = result["data"]["currency"]
+        except (KeyError, TypeError) as e:
+            raise CoinbaseError(f"Failed to parse response: {result}. Error: {e}")
+
     if time is None:
         time = datetime.datetime.now(tz.tzutc())
-    currency = result["data"]["currency"]
 
     return source.SourcePrice(price, time, currency)
 
