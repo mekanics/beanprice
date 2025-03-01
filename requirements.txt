@@ -1,3 +1,4 @@
 beancount>=3.0.0
 python-dateutil>=2.6.0
 requests>=2.0
+yfinance>=0.2.0; python_version >= "3.7"  # Optional but recommended for Yahoo Finance fallback
